@@ -258,3 +258,66 @@ fn test_prompt_input_deserialization_disambiguation() {
     let prompt4: PromptInput = serde_json::from_str(json4).unwrap();
     assert!(matches!(prompt4, PromptInput::String(_)));
 }
+
+#[test]
+fn test_prompt_input_empty_array_deserializes() {
+    // An empty JSON array matches the first sequence variant (IntBatch) under
+    // serde's untagged matching order. Pin this down so that reordering the enum
+    // cannot silently change how an empty prompt is interpreted.
+    let prompt: PromptInput = serde_json::from_str("[]").unwrap();
+    assert!(matches!(prompt, PromptInput::IntBatch(_)));
+    assert!(prompt.is_empty());
+
+    let req: CompletionRequest =
+        serde_json::from_str(r#"{"prompt": [], "max_tokens": 1}"#).unwrap();
+    assert!(matches!(req.prompt, PromptInput::IntBatch(_)));
+    assert!(req.prompt.is_empty());
+}
+
+#[test]
+fn test_prompt_input_all_forms_via_completion_request() {
+    // Every supported form must round-trip through CompletionRequest.
+    fn parse(json: &str) -> PromptInput {
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        req.prompt
+    }
+
+    assert!(matches!(
+        parse(r#"{"prompt": "hello", "max_tokens": 1}"#),
+        PromptInput::String(_)
+    ));
+    assert!(matches!(
+        parse(r#"{"prompt": ["a", "b"], "max_tokens": 1}"#),
+        PromptInput::StringArray(_)
+    ));
+    assert!(matches!(
+        parse(r#"{"prompt": [1, 2, 3], "max_tokens": 1}"#),
+        PromptInput::IntArray(_)
+    ));
+    assert!(matches!(
+        parse(r#"{"prompt": [[1, 2], [3]], "max_tokens": 1}"#),
+        PromptInput::IntBatch(_)
+    ));
+    assert!(matches!(
+        parse(r#"{"prompt": [], "max_tokens": 1}"#),
+        PromptInput::IntBatch(_)
+    ));
+}
+
+#[test]
+fn test_prompt_input_long_string_is_string() {
+    // Regression test for #310: long text prompts must deserialize as
+    // PromptInput::String. Before the enum was reordered, the untagged
+    // deserializer tried the sequence variants first and formatted the whole
+    // prompt into a discarded error on each attempt, costing hundreds of
+    // milliseconds per MiB of CJK text.
+    let chars = 64 * 1024;
+    let text = "汉".repeat(chars); // ~192 KiB of UTF-8
+    let json = serde_json::json!({"prompt": text, "max_tokens": 1}).to_string();
+
+    let req: CompletionRequest = serde_json::from_str(&json).unwrap();
+    match &req.prompt {
+        PromptInput::String(s) => assert_eq!(s.chars().count(), chars),
+        other => panic!("expected PromptInput::String, got {other:?}"),
+    }
+}
