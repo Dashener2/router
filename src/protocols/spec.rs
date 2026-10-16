@@ -111,57 +111,66 @@ impl<'de> Deserialize<'de> for ChatMessage {
     {
         use serde::de::Error;
 
-        let value = Value::deserialize(deserializer)?;
+        let mut value = Value::deserialize(deserializer)?;
         let role = value
             .get("role")
             .ok_or_else(|| D::Error::custom("missing role field"))?
             .as_str()
-            .ok_or_else(|| D::Error::custom("role field must be a string"))?;
+            .ok_or_else(|| D::Error::custom("role field must be a string"))?
+            .to_string();
 
-        match role {
-            "assistant" => Ok(ChatMessage::Assistant {
-                role: role.to_string(),
-                content: value.get("content").and_then(|content| {
-                    (!content.is_null())
-                        .then(|| serde_json::from_value(content.clone()).ok())
+        // Move the (potentially large) payload fields out of the map instead of
+        // cloning them. `content`, `tool_calls` and `function_call` can hold a
+        // whole prompt or tool output, so clone-then-reparse doubled the work for
+        // large messages.
+        fn take(value: &mut Value, key: &str) -> Option<Value> {
+            value.as_object_mut().and_then(|map| map.remove(key))
+        }
+
+        match role.as_str() {
+            "assistant" => {
+                let content = take(&mut value, "content").and_then(|c| {
+                    (!c.is_null())
+                        .then(|| serde_json::from_value(c).ok())
                         .flatten()
-                }),
-                name: value.get("name").and_then(|n| {
-                    if n.is_null() {
-                        None
-                    } else {
-                        n.as_str().map(String::from)
-                    }
-                }),
-                tool_calls: value.get("tool_calls").and_then(|tc| {
-                    if tc.is_null() {
-                        None
-                    } else {
-                        serde_json::from_value(tc.clone()).ok()
-                    }
-                }),
-                function_call: value.get("function_call").and_then(|fc| {
-                    if fc.is_null() {
-                        None
-                    } else {
-                        serde_json::from_value(fc.clone()).ok()
-                    }
-                }),
-                // `reasoning` is vLLM's canonical field. Prefer a usable canonical
-                // string when both keys are present; otherwise fall back to the
-                // deprecated `reasoning_content` alias, including when `reasoning`
-                // is null or not a string. Serialization remains canonical.
-                reasoning: value
-                    .get("reasoning")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.get("reasoning_content").and_then(Value::as_str))
-                    .map(String::from),
-            }),
+                });
+                let tool_calls = take(&mut value, "tool_calls").and_then(|tc| {
+                    (!tc.is_null())
+                        .then(|| serde_json::from_value(tc).ok())
+                        .flatten()
+                });
+                let function_call = take(&mut value, "function_call").and_then(|fc| {
+                    (!fc.is_null())
+                        .then(|| serde_json::from_value(fc).ok())
+                        .flatten()
+                });
+                Ok(ChatMessage::Assistant {
+                    role,
+                    content,
+                    name: value.get("name").and_then(|n| {
+                        if n.is_null() {
+                            None
+                        } else {
+                            n.as_str().map(String::from)
+                        }
+                    }),
+                    tool_calls,
+                    function_call,
+                    // `reasoning` is vLLM's canonical field. Prefer a usable canonical
+                    // string when both keys are present; otherwise fall back to the
+                    // deprecated `reasoning_content` alias, including when `reasoning`
+                    // is null or not a string. Serialization remains canonical.
+                    reasoning: value
+                        .get("reasoning")
+                        .and_then(Value::as_str)
+                        .or_else(|| value.get("reasoning_content").and_then(Value::as_str))
+                        .map(String::from),
+                })
+            }
             "system" => Ok(ChatMessage::System {
-                role: role.to_string(),
-                content: value
-                    .get("content")
-                    .and_then(|content| serde_json::from_value(content.clone()).ok())
+                role,
+                content: take(&mut value, "content")
+                    .and_then(|content| serde_json::from_value(content).ok())
                     .unwrap_or(UserMessageContent::Text(String::new())),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
@@ -172,15 +181,13 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 }),
             }),
             "user" => {
-                let content = value
-                    .get("content")
+                let content = take(&mut value, "content")
                     .map(|c| {
-                        serde_json::from_value(c.clone())
-                            .unwrap_or(UserMessageContent::Text(String::new()))
+                        serde_json::from_value(c).unwrap_or(UserMessageContent::Text(String::new()))
                     })
                     .unwrap_or(UserMessageContent::Text(String::new()));
                 Ok(ChatMessage::User {
-                    role: role.to_string(),
+                    role,
                     content,
                     name: value.get("name").and_then(|n| {
                         if n.is_null() {
@@ -192,10 +199,8 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 })
             }
             "tool" => Ok(ChatMessage::Tool {
-                role: role.to_string(),
-                content: value
-                    .get("content")
-                    .cloned()
+                role,
+                content: take(&mut value, "content")
                     .unwrap_or_else(|| Value::String(String::new())),
                 tool_call_id: value
                     .get("tool_call_id")
@@ -204,7 +209,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
                     .to_string(),
             }),
             "function" => Ok(ChatMessage::Function {
-                role: role.to_string(),
+                role,
                 content: value
                     .get("content")
                     .and_then(|c| c.as_str())
